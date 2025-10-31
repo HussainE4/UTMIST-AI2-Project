@@ -1,4 +1,6 @@
-from user.environment import *
+from environment.environment import *
+
+from environment.environment import MoveType
 
 
 class WarehouseBrawl(MalachiteEnv[np.ndarray, np.ndarray, int]):
@@ -165,8 +167,9 @@ class WarehouseBrawl(MalachiteEnv[np.ndarray, np.ndarray, int]):
             'Unarmed Recovery': MoveType.RECOVERY,
             'Unarmed Groundpound': MoveType.GROUNDPOUND,
         }
-
-        for file in sorted(os.listdir('attacks')):
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        ATTACK_DIR = os.path.join(BASE_DIR, 'attacks')
+        for file in sorted(ATTACK_DIR):
             name = file.split('.')[0]
             if name not in self.keys.keys(): continue
             with open(os.path.join('attacks', file)) as f:
@@ -206,8 +209,6 @@ class WarehouseBrawl(MalachiteEnv[np.ndarray, np.ndarray, int]):
             if player.on_platform is not None:
                 platform_vel = player.on_platform.velocity
                 player.body.velocity += pymunk.Vec2d(platform_vel.x, platform_vel.y)
-            
-
 
         # Process physics info
         for obj_name, obj in self.objects.items():

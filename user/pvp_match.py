@@ -5,10 +5,10 @@ from user.my_agent import SubmittedAgent
 import pygame
 pygame.init()
 
-my_agent = UserInputAgent()
+my_agent = ConstantAgent()
 
 #Input your file path here in SubmittedAgent if you are loading a model:
-opponent = SubmittedAgent(file_path=None)
+opponent = SubmittedAgent(file_path=r"checkpoints\sanity_0\rl_model_4700047_steps.zip")
 
 match_time = 99999
 

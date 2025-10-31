@@ -17,6 +17,8 @@ import torch
 import gymnasium as gym
 from torch.nn import functional as F
 from torch import nn as nn
+import cProfile
+import pstats
 import numpy as np
 import pygame
 from stable_baselines3 import A2C, PPO, SAC, DQN, DDPG, TD3, HER 
@@ -26,6 +28,10 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from environment.agent import *
 from typing import Optional, Type, List, Tuple
+
+from user.Common import RewTerm
+from user.agents import BigMLPExtractor, MLPPolicy
+
 
 # -------------------------------------------------------------------------
 # ----------------------------- AGENT CLASSES -----------------------------
@@ -49,7 +55,7 @@ class SB3Agent(Agent):
 
     def _initialize(self) -> None:
         if self.file_path is None:
-            self.model = self.sb3_class("MlpPolicy", self.env, verbose=0, n_steps=30*90*3, batch_size=128, ent_coef=0.01)
+            self.model = self.sb3_class("MlpPolicy", self.env, verbose=0, n_steps=30*90*3, batch_size=128, ent_coef=0.01, device="cuda")
             del self.env
         else:
             self.model = self.sb3_class.load(self.file_path)
@@ -98,7 +104,6 @@ class RecurrentPPOAgent(Agent):
                 'shared_lstm': True,
                 'enable_critic_lstm': False,
                 'share_features_extractor': True,
-
             }
             self.model = RecurrentPPO("MlpLstmPolicy",
                                       self.env,
@@ -106,7 +111,8 @@ class RecurrentPPOAgent(Agent):
                                       n_steps=30*90*20,
                                       batch_size=16,
                                       ent_coef=0.05,
-                                      policy_kwargs=policy_kwargs)
+                                      policy_kwargs=policy_kwargs,
+                                      device="cuda")
             del self.env
         else:
             self.model = RecurrentPPO.load(self.file_path)
@@ -126,6 +132,75 @@ class RecurrentPPOAgent(Agent):
         self.model.set_env(env)
         self.model.verbose = verbose
         self.model.learn(total_timesteps=total_timesteps, log_interval=log_interval)
+
+
+class CoolPPOAgent(Agent):
+    '''
+    RecurrentPPOAgent:
+    - Defines an RL Agent that uses the Recurrent PPO (LSTM+PPO) algorithm
+    '''
+    def __init__(
+            self,
+            file_path: Optional[str] = None
+    ):
+        super().__init__(file_path)
+        self.lstm_states = None
+        self.episode_starts = np.ones((1,), dtype=bool)
+
+    def _initialize(self) -> None:
+        if self.file_path is None:
+            policy_kwargs = {
+                # Nonlinearity suitable for control; GELU works great for timing-based actions
+                'activation_fn': nn.GELU,
+
+                # Shared recurrent layer
+                'shared_lstm': True,
+                'enable_critic_lstm': False,  # let critic have its own memory of state value
+                'share_features_extractor': True,
+
+                # Bigger recurrent state — allows tracking combos, dodges, etc.
+                'lstm_hidden_size': 768,
+
+                # Deeper policy/value heads
+                'net_arch': [
+                    dict(
+                        pi=[256, 128, 64],  # policy (action decision path)
+                        vf=[256, 128, 64]  # value (state evaluation path)
+                    )
+                ],
+
+                # Optional but good for stability in fast-paced envs
+                'ortho_init': True,
+            }
+
+            self.model = RecurrentPPO("MlpLstmPolicy",
+                                      self.env,
+                                      verbose=0,
+                                      n_steps=30*90*20,
+                                      batch_size=16,
+                                      ent_coef=0.05,
+                                      policy_kwargs=policy_kwargs,
+                                      device="cuda")
+            del self.env
+        else:
+            self.model = RecurrentPPO.load(self.file_path)
+
+    def reset(self) -> None:
+        self.episode_starts = True
+
+    def predict(self, obs):
+        action, self.lstm_states = self.model.predict(obs, state=self.lstm_states, episode_start=self.episode_starts, deterministic=True)
+        if self.episode_starts: self.episode_starts = False
+        return action
+
+    def save(self, file_path: str) -> None:
+        self.model.save(file_path)
+
+    def learn(self, env, total_timesteps, log_interval: int = 2, verbose=0):
+        self.model.set_env(env)
+        self.model.verbose = verbose
+        self.model.learn(total_timesteps=total_timesteps, log_interval=log_interval)
+
 
 class BasedAgent(Agent):
     '''
@@ -254,30 +329,7 @@ class ClockworkAgent(Agent):
         action = self.act_helper.press_keys(self.current_action_data)
         self.steps += 1  # Increment step counter
         return action
-    
-class MLPPolicy(nn.Module):
-    def __init__(self, obs_dim: int = 64, action_dim: int = 10, hidden_dim: int = 64):
-        """
-        A 3-layer MLP policy:
-        obs -> Linear(hidden_dim) -> ReLU -> Linear(hidden_dim) -> ReLU -> Linear(action_dim)
-        """
-        super(MLPPolicy, self).__init__()
 
-        # Input layer
-        self.fc1 = nn.Linear(obs_dim, hidden_dim, dtype=torch.float32)
-        # Hidden layer
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim, dtype=torch.float32)
-        # Output layer
-        self.fc3 = nn.Linear(hidden_dim, hidden_dim, dtype=torch.float32)
-
-    def forward(self, obs):
-        """
-        obs: [batch_size, obs_dim]
-        returns: [batch_size, action_dim]
-        """
-        x = F.relu(self.fc1(obs))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
 
 class MLPExtractor(BaseFeaturesExtractor):
     '''
@@ -300,41 +352,8 @@ class MLPExtractor(BaseFeaturesExtractor):
             features_extractor_class=cls,
             features_extractor_kwargs=dict(features_dim=features_dim, hidden_dim=hidden_dim) #NOTE: features_dim = 10 to match action space output
         )
-    
-class CustomAgent(Agent):
-    def __init__(self, sb3_class: Optional[Type[BaseAlgorithm]] = PPO, file_path: str = None, extractor: BaseFeaturesExtractor = None):
-        self.sb3_class = sb3_class
-        self.extractor = extractor
-        super().__init__(file_path)
-    
-    def _initialize(self) -> None:
-        if self.file_path is None:
-            self.model = self.sb3_class("MlpPolicy", self.env, policy_kwargs=self.extractor.get_policy_kwargs(), verbose=0, n_steps=30*90*3, batch_size=128, ent_coef=0.01)
-            del self.env
-        else:
-            self.model = self.sb3_class.load(self.file_path)
 
-    def _gdown(self) -> str:
-        # Call gdown to your link
-        return
 
-    #def set_ignore_grad(self) -> None:
-        #self.model.set_ignore_act_grad(True)
-
-    def predict(self, obs):
-        action, _ = self.model.predict(obs)
-        return action
-
-    def save(self, file_path: str) -> None:
-        self.model.save(file_path, include=['num_timesteps'])
-
-    def learn(self, env, total_timesteps, log_interval: int = 1, verbose=0):
-        self.model.set_env(env)
-        self.model.verbose = verbose
-        self.model.learn(
-            total_timesteps=total_timesteps,
-            log_interval=log_interval,
-        )
 
 # --------------------------------------------------------------------------------
 # ----------------------------- REWARD FUNCTIONS API -----------------------------
@@ -493,6 +512,82 @@ def head_to_opponent(
 
     return reward
 
+def do_something(
+    env: WarehouseBrawl,
+) -> float:
+
+    # Get player object from the environment
+    player: Player = env.objects["player"]
+
+    # Apply penalty if the player is in the danger zone
+    multiplier = -1 if player.body.position.x == player.prev_x else 1
+
+    return multiplier
+
+def do_based(
+    env: WarehouseBrawl,
+) -> float:
+
+    # Get player object from the environment
+    player: Player = env.objects["player"]
+    opp: Player = env.objects["opponent"]
+
+    obs = player.get_obs()
+    opp_obs = opp.get_obs()
+    #print("obervation", obs)
+    pos = env.obs_helper.get_section(obs, 'player_pos')
+    opp_pos = env.obs_helper.get_section(opp_obs, 'player_pos')
+    opp_KO = env.obs_helper.get_section(obs, 'opponent_state') in [5, 11]
+    #print("obervationss", pos, opp_pos, opp_KO, env.obs_helper)
+    reward = 0
+
+    action = 0
+    # If off the edge, come back
+    if pos[0] > 10.67 / 2:
+        action = -1
+    elif pos[0] < -10.67 / 2:
+        action = 1
+    elif not opp_KO:
+        # Head toward opponent
+        if opp_pos[0] > pos[0]:
+            action = 1
+        else:
+            action = -1
+
+    current_vel = (player.body.position.x - player.prev_x)
+
+    reward += current_vel * action
+    reward = reward / 5.0
+
+    # Note: Passing in partial action
+    # Jump if below map or opponent is above you
+    if (pos[1] > 1.6 or pos[1] > opp_pos[1]):
+        if player.jump_cooldown > 0:
+            reward += .05
+
+    # Attack if near
+    if (pos[0] - opp_pos[0]) ** 2 + (pos[1] - opp_pos[1]) ** 2 < 4.0:
+        if isinstance(player.state, AttackState):
+            reward += 1
+    else:
+        if isinstance(player.state, AttackState):
+            reward -= 1
+
+    return reward
+
+def doing_anything(
+    env: WarehouseBrawl,
+) -> float:
+
+    # Get player object from the environment
+    player: Player = env.objects["player"]
+
+    # Apply penalty if the player is holding more than 3 keys
+    a = player.cur_action
+    if (a > 0.5).sum() > 0:
+        return env.dt
+    return 0
+
 def holding_more_than_3_keys(
     env: WarehouseBrawl,
 ) -> float:
@@ -544,38 +639,35 @@ Add your dictionary of RewardFunctions here using RewTerms
 def gen_reward_manager():
     reward_functions = {
         #'target_height_reward': RewTerm(func=base_height_l2, weight=0.0, params={'target_height': -4, 'obj_name': 'player'}),
-        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=0.5),
-        'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=1.0),
+        #'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=0.5),
+        #'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=1.0),
+        #'noIdle': RewTerm(func=do_something, weight=.01),
+        #'imitateBased': RewTerm(func=do_based, weight=1),
         #'head_to_middle_reward': RewTerm(func=head_to_middle_reward, weight=0.01),
-        #'head_to_opponent': RewTerm(func=head_to_opponent, weight=0.05),
-        'penalize_attack_reward': RewTerm(func=in_state_reward, weight=-0.04, params={'desired_state': AttackState}),
-        'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=-0.01),
+        #'head_to_opponent': RewTerm(func=head_to_opponent, weight=0.1),
+        #'penalize_attack_reward': RewTerm(func=in_state_reward, weight=-0.05, params={'desired_state': AttackState}),
+        #'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=-1),
+        'doing stuff': RewTerm(func=doing_anything, weight=-1),
         #'taunt_reward': RewTerm(func=in_state_reward, weight=0.2, params={'desired_state': TauntState}),
     }
     signal_subscriptions = {
-        'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=50)),
-        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=8)),
-        'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=5)),
-        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=10)),
-        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=15))
+        #'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=100)),
+        #'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=20)),
+        #'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=5)),
+        #'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=10)),
+        #'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=15))
     }
     return RewardManager(reward_functions, signal_subscriptions)
 
-# -------------------------------------------------------------------------
-# ----------------------------- MAIN FUNCTION -----------------------------
-# -------------------------------------------------------------------------
-'''
-The main function runs training. You can change configurations such as the Agent type or opponent specifications here.
-'''
 if __name__ == '__main__':
     # Create agent
-    my_agent = CustomAgent(sb3_class=PPO, extractor=MLPExtractor)
+    #my_agent = CustomAgent(sb3_class=PPO, extractor=BigMLPExtractor)
 
     # Start here if you want to train from scratch. e.g:
-    #my_agent = RecurrentPPOAgent()
+    #my_agent = CoolPPOAgent()
 
     # Start here if you want to train from a specific timestep. e.g:
-    #my_agent = RecurrentPPOAgent(file_path='checkpoints/experiment_3/rl_model_120006_steps.zip')
+    my_agent = CustomAgent(sb3_class=PPO, extractor=BigMLPExtractor)
 
     # Reward manager
     reward_manager = gen_reward_manager()
@@ -585,29 +677,23 @@ if __name__ == '__main__':
                                  # type(my_agent) = Agent class
     )
 
-    # Set save settings here:
-    save_handler = SaveHandler(
-        agent=my_agent, # Agent to save
-        save_freq=100_000, # Save frequency
-        max_saved=40, # Maximum number of saved models
-        save_path='checkpoints', # Save path
-        run_name='experiment_9',
-        mode=SaveHandlerMode.FORCE # Save mode, FORCE or RESUME
-    )
-
     # Set opponent settings here:
     opponent_specification = {
                     'self_play': (8, selfplay_handler),
-                    'constant_agent': (0.5, partial(ConstantAgent)),
-                    'based_agent': (1.5, partial(BasedAgent)),
+                    'constant_agent': (.5, partial(ConstantAgent)),
+                    'based_agent': (2, partial(BasedAgent)),
                 }
     opponent_cfg = OpponentsCfg(opponents=opponent_specification)
+    with cProfile.Profile() as pr:
+        train(
+            "sanity_2",
+            reward_manager,
+            opponent_cfg,
+            CameraResolution.LOW,
+            train_timesteps=50_000_000,
+            train_logging=TrainLogging.PLOT,
+            n_envs=1
+        )
 
-    train(my_agent,
-        reward_manager,
-        save_handler,
-        opponent_cfg,
-        CameraResolution.LOW,
-        train_timesteps=1_000_000_000,
-        train_logging=TrainLogging.PLOT
-    )
+    stats = pstats.Stats(pr)
+    stats.sort_stats(pstats.SortKey.TIME).print_stats(40)

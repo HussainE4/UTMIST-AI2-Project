@@ -35,6 +35,9 @@ class SubmittedAgent(Agent):
         file_path: Optional[str] = None,
     ):
         super().__init__(file_path)
+        self.t = 0
+        self.j = False
+
 
         # To run a TTNN model, you must maintain a pointer to the device and can be done by 
         # uncommmenting the line below to use the device pointer
@@ -66,8 +69,80 @@ class SubmittedAgent(Agent):
         return data_path
 
     def predict(self, obs):
-        action, _ = self.model.predict(obs)
+        action, _ = self.model.predict(self.observation_override(obs))
+        self.t += 1
+
+        return self.agent_override(obs, action)
+
+    def observation_override(self, obs):
+        pos = self.obs_helper.get_section(obs, 'player_pos')
+        opp_pos = self.obs_helper.get_section(obs, 'opponent_pos')
+        obs[10] = 0
+        obs[11] = 0
+        obs[13] = 3
+        weapon_t = self.obs_helper.get_section(obs, 'player_weapon_type')
+        if weapon_t != 0:
+            if pos[0] > opp_pos[0] + 0.3:
+                obs[32] -= .7
+            if pos[0] < opp_pos[0] - 0.3:
+                obs[32] += .7
+        return obs
+
+    def agent_override(self, obs, action):
+        pos = self.obs_helper.get_section(obs, 'player_pos')
+        opp_pos = self.obs_helper.get_section(obs, 'opponent_pos')
+        weapon_t = self.obs_helper.get_section(obs, 'player_weapon_type')
+
+
+        if weapon_t == 0 and self.t % 2 == 0:
+            action[5] = 1
+        else:
+            action[5] = 0
+        if pos[1] > 4:
+            action[4] = 1
+        opp_att = self.obs_helper.get_section(obs, 'opponent_state')  == 8
+        if pos[1] < 1 and action[4] > 0.5:
+            action[4] = 0
+
+        if action[4] > 0.4:
+            action[4] = 1
+
+        if self.j:
+            action[4] = 0
+            self.j = False
+        elif action[4] > 0.5:
+            self.j = True
+
+        if action[7] > 0.3 or action[8] > 0.3:
+            if pos[0] > opp_pos[0]:
+                action[3] = 0
+                action[1] = 1
+            if pos[0] < opp_pos[0]:
+                action[3] = 1
+                action[1] = 0
+            action[0] = 1 if pos[1] < opp_pos[1] - .5 else 0
+            action[2] = 1 if pos[1] > opp_pos[1] + .5 else 0
+
+        if pos[0] > 10.67/2:
+            action[1] = 1
+            action[3] = 0
+        elif pos[0] < -10.67/2:
+            action[3] = 1
+            action[1] = 0
+
+        if (pos[0] - opp_pos[0]) ** 2 + (pos[1] - opp_pos[1]) ** 2 < 1.0:
+            if opp_att:
+                action[6] = 1
+            elif action[4] > 0:
+                if action[7] > action[8]:
+                    action[7] = 1
+                    action[8] = 0
+                else:
+                    action[8] = 1
+                    action[7] = 0
+
         return action
+
 
     def save(self, file_path: str) -> None:
         self.model.save(file_path)

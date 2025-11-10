@@ -246,6 +246,7 @@ class SubmittedAgent(Agent):
 
     def _initialize(self) -> None:
         #self.model = MovementClassifier().to(self.device)
+        gdown.download("https://drive.google.com/file/d/1hanV_E2B6f59FOKstsaIeEUcwCuOvK0n/view?usp=sharing", "movement_classifier_c.pt", quiet=False)
         state_dict = torch.load("movement_classifier_c.pt", map_location=self.device)
         print(state_dict.keys())
         #self.model.load_state_dict(state_dict)
